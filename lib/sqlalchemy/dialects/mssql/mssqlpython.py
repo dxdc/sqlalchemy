@@ -38,10 +38,49 @@ Examples of connecting with the mssql-python driver::
         "mssql+mssqlpython://hostname/database?authentication=ActiveDirectoryIntegrated"
     )
 
+
+.. _mssqlpython_bulk_copy:
+
+Bulk Copy Support
+-----------------
+
+The mssql-python driver supports SQL Server's native bulk copy protocol
+via the ``cursor.bulkcopy()`` method.  When the ``use_bulkcopy`` parameter
+is set on :func:`_sa.create_engine`, the dialect will route
+``executemany()`` INSERT operations through the bulk copy API for
+dramatically faster write performance::
+
+    engine = create_engine(
+        "mssql+mssqlpython://user:password@hostname/database",
+        use_bulkcopy=True,
+    )
+
+This is analogous to the ``fast_executemany`` parameter on the
+:ref:`pyodbc <mssql_pyodbc>` dialect, but uses the TDS bulk load
+protocol instead of batched parameter arrays.  The performance
+difference can be significant for large INSERT batches, including
+those produced by ``pandas.DataFrame.to_sql()``.
+
+Additional options may be passed to ``create_engine()``::
+
+    engine = create_engine(
+        "mssql+mssqlpython://user:password@hostname/database",
+        use_bulkcopy=True,
+        bulkcopy_batch_size=50000,   # rows per batch (default 10000)
+        bulkcopy_table_lock=True,    # table lock for throughput (default True)
+    )
+
+If the ``bulkcopy()`` call fails for any reason, the dialect will
+automatically fall back to the standard ``cursor.executemany()``
+and emit a warning.
+
+.. versionadded:: 2.1.x
+
 """  # noqa
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
 from typing import Dict
@@ -62,6 +101,17 @@ if TYPE_CHECKING:
     from ...engine.interfaces import DBAPIModule
     from ...engine.interfaces import IsolationLevel
     from ...engine.interfaces import URL
+
+logger = logging.getLogger(__name__)
+
+# Regex to extract the target table from an INSERT statement.
+# Handles: INSERT INTO [dbo].[Users] (...) / INSERT INTO dbo.Users (...)
+_INSERT_TABLE_RE = re.compile(
+    r"^\s*INSERT\s+INTO\s+"
+    r"(\[?[\w.]+\]?(?:\.\[?[\w]+\]?)*)"
+    r"\s*\(",
+    re.IGNORECASE,
+)
 
 
 class _MSNumeric_mssqlpython(_ms_numeric_pyodbc, sqltypes.Numeric):
@@ -94,10 +144,23 @@ class MSDialect_mssqlpython(MSDialect):
         },
     )
 
-    def __init__(self, enable_pooling=False, **kw):
+    def __init__(
+        self,
+        enable_pooling=False,
+        use_bulkcopy=False,
+        bulkcopy_batch_size=10000,
+        bulkcopy_table_lock=True,
+        **kw,
+    ):
         super().__init__(**kw)
         if not enable_pooling and self.dbapi is not None:
             self.loaded_dbapi.pooling(enabled=False)
+
+        self.use_bulkcopy = use_bulkcopy
+        self.bulkcopy_batch_size = bulkcopy_batch_size
+        self.bulkcopy_table_lock = bulkcopy_table_lock
+        if use_bulkcopy:
+            self.use_insertmanyvalues_wo_returning = False
 
     @classmethod
     def import_dbapi(cls) -> DBAPIModule:
@@ -148,6 +211,42 @@ class MSDialect_mssqlpython(MSDialect):
         connectors.extend(["%s=%s" % (k, v) for k, v in keys.items()])
 
         return ((";".join(connectors),), connect_args)
+
+    def do_executemany(self, cursor, statement, parameters, context=None):
+        if self.use_bulkcopy and parameters:
+            table = self._extract_insert_table(statement)
+            if table is not None and hasattr(cursor, "bulkcopy"):
+                if isinstance(parameters[0], dict):
+                    keys = list(parameters[0].keys())
+                    rows = [tuple(p[k] for k in keys) for p in parameters]
+                else:
+                    rows = [tuple(p) for p in parameters]
+
+                try:
+                    cursor.bulkcopy(
+                        table_name=table,
+                        data=rows,
+                        batch_size=self.bulkcopy_batch_size,
+                        table_lock=self.bulkcopy_table_lock,
+                    )
+                    return
+                except Exception:
+                    logger.warning(
+                        "bulkcopy failed for %s, falling back to "
+                        "executemany",
+                        table,
+                        exc_info=True,
+                    )
+
+        super().do_executemany(cursor, statement, parameters, context=context)
+
+    @staticmethod
+    def _extract_insert_table(statement: str) -> Optional[str]:
+        """Parse the target table from an INSERT statement, or None."""
+        m = _INSERT_TABLE_RE.match(statement)
+        if m:
+            return m.group(1)
+        return None
 
     def is_disconnect(
         self,

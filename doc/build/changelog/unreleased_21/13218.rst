@@ -1,0 +1,11 @@
+.. change::
+    :tags: feature, mssql
+    :tickets: 13218
+
+    Added ``use_bulkcopy`` parameter to the :ref:`mssql+mssqlpython <mssql_mssqlpython>`
+    dialect, which routes ``executemany()`` INSERT operations through the
+    ``cursor.bulkcopy()`` API for dramatically faster write performance using
+    SQL Server's native TDS bulk load protocol.  This is analogous to the
+    ``fast_executemany`` parameter on the :ref:`pyodbc <mssql_pyodbc>` dialect.
+    Additional parameters ``bulkcopy_batch_size`` and ``bulkcopy_table_lock``
+    are also available.
